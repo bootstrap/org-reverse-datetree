@@ -1,30 +1,40 @@
+# -*- mode: org; mode: org-make-toc -*-
 * org-reverse-datetree
 [[https://melpa.org/#/org-reverse-datetree][https://melpa.org/packages/org-reverse-datetree-badge.svg]]
-[[https://travis-ci.org/akirak/org-reverse-datetree][https://travis-ci.org/akirak/org-reverse-datetree.svg?branch=master]]
+[[https://github.com/akirak/org-reverse-datetree/workflows/CI/badge.svg][https://github.com/akirak/org-reverse-datetree/workflows/CI/badge.svg]]
 
 This package provides functions for creating reverse
-date trees, which are similar to date trees created by built-in
-functions of Org mode (e.g. =org-capture= and =org-archive=) but in a
+date trees, which are similar to date trees as supported by built-in
+functions of Org mode (e.g. =org-capture=) but in a
 reversed order. Since newer contents come first in reverse date trees,
 they are more useful in situations where you want to find latest
 activities on a particular subject using a search tool like
 [[https://github.com/alphapapa/helm-org-rifle][helm-org-rifle]].
 
 [[file:screenshots/org-reverse-datetree-1.png]]
-
 ** Table of contents
 :PROPERTIES:
 :TOC:      siblings
 :END:
-    -  [[#features][Features]]
-    -  [[#prerequisites][Prerequisites]]
-    -  [[#usage][Usage]]
-      -  [[#configuring-date-formats][Configuring date formats]]
-      -  [[#defining-a-capture-template][Defining a capture template]]
-      -  [[#jumping-to-a-particular-date][Jumping to a particular date]]
-      -  [[#defining-a-refile-function][Defining a refile function]]
-      -  [[#defining-an-agenda-command][Defining an agenda command]]
-    -  [[#license][License]]
+-  [[#features][Features]]
+-  [[#prerequisites][Prerequisites]]
+-  [[#usage][Usage]]
+  -  [[#configuring-date-formats][Configuring date formats]]
+    -  [[#non-reverse-date-tree][Non-reverse date tree]]
+  -  [[#defining-a-capture-template][Defining a capture template]]
+  -  [[#jumping-to-a-particular-date][Jumping to a particular date]]
+  -  [[#defining-a-refile-function][Defining a refile function]]
+  -  [[#archiving][Archiving]]
+  -  [[#defining-an-agenda-command][Defining an agenda command]]
+  -  [[#cleaning-up-empty-dates][Cleaning up empty dates]]
+-  [[#configuration-examples][Configuration examples]]
+-  [[#changelog][Changelog]]
+  -  [[#035-2020-11-28][0.3.5 (2020-11-28)]]
+  -  [[#034-2020-09-23][0.3.4 (2020-09-23)]]
+  -  [[#033-2020-03-25][0.3.3 (2020-03-25)]]
+  -  [[#032-2020-03-21][0.3.2 (2020-03-21)]]
+  -  [[#031-2020-02-24][0.3.1 (2020-02-24)]]
+-  [[#license][License]]
 
 ** Features
 - Reverse date trees, where latest contents are shown first.
@@ -57,9 +67,23 @@ You can customize the default format by setting
 =org-reverse-datetree-{year,month,week,date}-format=.
 Note that the formats should be basically numeric and zero-prefixed, since
 date-tree headings are ordered lexicographically by their texts.
-You should avoid a month format containing a string like "Feb" or "February".
+You should avoid a month format starting with a string like "Feb" or "February". If you want to contain one, you should append it to a zero-prefixed numeric month.
 
 Another way to configure the structure is to set =org-reverse-datetree-level-formats= variable as a file-local variable. Through the variable, you can define a structure with any number of levels.
+For example, the following configuration enables date trees consisting of four levels (year-month-week-date) in all files (thanks [[https://github.com/samspo][@samspo]] for [[https://github.com/akirak/org-reverse-datetree/issues/4][reporting]]):
+
+#+begin_src emacs-lisp
+  (setq-default org-reverse-datetree-level-formats
+                '("%Y"                    ; year
+                  (lambda (time) (format-time-string "%Y-%m %B" (org-reverse-datetree-monday time))) ; month
+                  "%Y W%W"                ; week
+                  "%Y-%m-%d %A"           ; date
+                  ))
+#+end_src
+**** Non-reverse date tree
+Even though this package is named =org-reverse-datetree=, it is now possible to create a non-reverse date tree, i.e. a normal ascending date tree.
+
+To enable the feature, set =org-reverse-datetree-non-reverse= variable to non-nil. It is a file-local variable. The default continues to be a reverse date tree.
 *** Defining a capture template
 You can define an =org-capture= template which inserts an entry into a date tree with [[https://github.com/akirak/org-starter][org-starter]] package as follows:
 
@@ -108,6 +132,18 @@ A recommended way to invoke this command is to add an entry to =org-starter-extr
 #+end_src
 
 Then you can run =org-starter-refile-by-key= and press ~p~ key to refile the selected entries to =cpb.org=.
+*** Archiving
+:PROPERTIES:
+:CREATED_TIME: [2020-03-25 Wed 19:04]
+:END:
+You can archive a tree to a reverse datetree using =org-reverse-datetree-archive-subtree= command.
+It also works on multiple trees in an active region.
+
+The destination is specified in either =REVERSE_DATETREE_ARCHIVE_FILE= property (inherited) or =REVERSE_DATETREE_ARCHIVE_FILE= file header. It should be a file path.
+For now, the target file cannot contain multiple date trees.
+
+From inside =org-agenda=, you can use =org-reverse-datetree-agenda-archive=.
+It doesn't work on bulk entries for now.
 *** Defining an agenda command
 With [[https://github.com/alphapapa/org-ql][org-ql]] package, you can define a function for browsing entries in a reverse date tree:
 
@@ -130,8 +166,22 @@ You can also define a custom org-agenda command:
 #+end_src
 
 =org-super-agenda-groups= is an option for [[https://github.com/alphapapa/org-super-agenda][org-super-agenda]] for grouping the contents. If you don't activate =org-super-agenda-mode=, that option is simply ignoerd.
+*** Cleaning up empty dates
+You can use =org-reverse-datetree-cleanup-empty-dates= command to clean up date entries that contains no children.
+** Configuration examples
+- [[https://out-of-cheese-error.netlify.com/spacemacs-config#org7963676][An Annotated Spacemacs - For an org-mode workflow ·]]: Using the package in some of his =org-capture= templates for clippling URLs, notes, and tasks.
+** Changelog
+*** 0.3.5 (2020-11-28)
+- Fix bugs with =org-reverse-datetree-cleanup-empty-dates=.
+- Switch to [[https://github.com/akirak/elinter/][elinter]] for CI.
+*** 0.3.4 (2020-09-23)
+Add a function for archiving from org-agenda, =org-reverse-datetree-agenda-archive=.
+*** 0.3.3 (2020-03-25)
+Add an initial support for archiving.
+*** 0.3.2 (2020-03-21)
+Add support for a non-reverse date tree.
+*** 0.3.1 (2020-02-24)
+- Fix a bunch of issues with =org-reverse-datetree-cleanup-empty-dates=. Explicitly documented the function in README.
+- Switch to GitHub Actions on running CI.
 ** License
 GPL v3
-# Local Variables:
-# org-make-toc-mode: t
-# End:

@@ -1,10 +1,10 @@
 ;;; org-reverse-datetree.el --- Create reverse date trees in org-mode -*- lexical-binding: t -*-
 
-;; Copyright (C) 2018-2019 Akira Komamura
+;; Copyright (C) 2018-2020 Akira Komamura
 
 ;; Author: Akira Komamura <akira.komamura@gmail.com>
-;; Version: 0.3
-;; Package-Requires: ((emacs "26.1") (dash "2.12"))
+;; Version: 0.3.5
+;; Package-Requires: ((emacs "26.1") (dash "2.12") (org "9.3"))
 ;; Keywords: outlines
 ;; URL: https://github.com/akirak/org-reverse-datetree
 
@@ -23,7 +23,7 @@
 ;; GNU General Public License for more details.
 ;;
 ;; You should have received a copy of the GNU General Public License
-;; along with this program.  If not, see <http://www.gnu.org/licenses/>.
+;; along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 ;;; Commentary:
 
@@ -41,16 +41,27 @@
 (require 'cl-lib)
 (require 'dash)
 
-(autoload 'org-element-map "org-element")
-(autoload 'org-element-parse-buffer "org-element")
-(autoload 'org-element-property "org-element")
+;; Silent byte compilers
+(declare-function org-element-map "ext:org-element")
+(declare-function org-element-parse-buffer "ext:org-element")
+(declare-function org-element-property "ext:org-element")
 (defvar org-agenda-buffer-name)
 (defvar org-agenda-bulk-marked-entries)
 (defvar org-agenda-persistent-marks)
-(autoload 'org-agenda-error "org-agenda")
-(autoload 'org-agenda-bulk-unmark-all "org-agenda")
-(autoload 'org-agenda-redo "org-agenda")
-(autoload 'org-remove-subtree-entries-from-agenda "org-agenda")
+(declare-function org-agenda-error "ext:org-agenda")
+(declare-function org-agenda-bulk-unmark-all "ext:org-agenda")
+(declare-function org-agenda-redo "ext:org-agenda")
+(declare-function org-remove-subtree-entries-from-agenda "ext:org-agenda")
+(declare-function org-agenda-archive-with "ext:org-agenda")
+(defvar org-archive-subtree-save-file-p)
+(defvar org-archive-save-context-info)
+(defvar org-archive-mark-done)
+(defvar org-archive-subtree-add-inherited-tags)
+(defvar org-archive-file-header-format)
+(defvar org-refile-active-region-within-subtree)
+(declare-function project-roots "ext:project")
+(declare-function project-current "ext:project")
+(declare-function org-inlinetask-remove-END-maybe "ext:org-inlinetask")
 
 (defgroup org-reverse-datetree nil
   "Reverse date trees for Org mode."
@@ -110,8 +121,12 @@ in the Org header."
 (defvar-local org-reverse-datetree--file-headers nil
   "Alist of headers of the buffer.")
 
+(defvar-local org-reverse-datetree-non-reverse nil
+  "If non-nil, creates a non-reverse date tree.")
+
 (cl-defun org-reverse-datetree--find-or-prepend (level text
-                                                       &key append-newline)
+                                                       &key append-newline
+                                                       &allow-other-keys)
   "Find or create a heading at a given LEVEL with TEXT.
 
 If APPEND-NEWLINE is non-nil, a newline is appended to the
@@ -141,7 +156,8 @@ The format can be either a function or a string."
     (function (funcall format time))))
 
 ;;;###autoload
-(defun org-reverse-datetree-2 (time level-formats return-type)
+(cl-defun org-reverse-datetree-2 (time level-formats return-type
+                                       &key asc)
   "Jump to the specified date in a reverse date tree.
 
 TIME is the date to be inserted.  If omitted, it will be today.
@@ -163,21 +179,25 @@ following values:
   argument of `org-refile' function.
 
 \"created\"
-  Returns non-nil if and only if a new tree is created."
+  Returns non-nil if and only if a new tree is created.
+
+If ASC is non-nil, it creates a non-reverse date tree."
   (unless (derived-mode-p 'org-mode)
     (user-error "Not in org-mode"))
   (save-restriction
     (widen)
-    (org-save-outline-visibility nil
+    (org-save-outline-visibility t
       (outline-show-all)
       (goto-char (point-min))
       (cl-loop for (level . format) in (-zip (number-sequence 1 (length level-formats))
                                              (-butlast level-formats))
                do (funcall org-reverse-datetree-find-function
                            level
-                           (org-reverse-datetree--apply-format format time)))
+                           (org-reverse-datetree--apply-format format time)
+                           :asc asc))
       (let ((new (funcall org-reverse-datetree-find-function (length level-formats)
-                          (org-reverse-datetree--apply-format (-last-item level-formats) time))))
+                          (org-reverse-datetree--apply-format (-last-item level-formats) time)
+                          :asc asc)))
         (cl-case return-type
           ('marker (point-marker))
           ('point (point))
@@ -206,7 +226,7 @@ a command like `helm-org-rifle'.
 
 `org-reverse-datetree-find-function' is used to find or insert trees.
 
-TIME is the date to be inserted. If omitted, it will be today.
+TIME is the date to be inserted.  If omitted, it will be today.
 
 If WEEK-TREE is non-nil, it creates week trees.  Otherwise, it
 creates month trees.
@@ -240,7 +260,40 @@ For RETURN, see the documentation of `org-reverse-datetree-2'."
            org-reverse-datetree-week-format
            org-reverse-datetree-date-format))))
 
-(cl-defun org-reverse-datetree--find-or-insert (level text)
+(defun org-reverse-datetree--get-level-formats ()
+  "Return a list of outline formats for the current buffer."
+  (or org-reverse-datetree-level-formats
+      (progn
+        (org-reverse-datetree--get-file-headers)
+        (let* ((type (org-reverse-datetree--lookup-type-header-1))
+               (org-reverse-datetree-year-format
+                (org-reverse-datetree--lookup-format-header
+                 "REVERSE_DATETREE_YEAR_FORMAT"
+                 "Year format: "
+                 org-reverse-datetree-year-format))
+               (org-reverse-datetree-month-format
+                (when (memq type '(month month-and-week))
+                  (org-reverse-datetree--lookup-format-header
+                   "REVERSE_DATETREE_MONTH_FORMAT"
+                   "Month format: "
+                   org-reverse-datetree-month-format)))
+               (org-reverse-datetree-week-format
+                (when (memq type '(week month-and-week))
+                  (org-reverse-datetree--lookup-format-header
+                   "REVERSE_DATETREE_WEEK_FORMAT"
+                   "Week format: "
+                   org-reverse-datetree-week-format)))
+               (org-reverse-datetree-date-format
+                (org-reverse-datetree--lookup-format-header
+                 "REVERSE_DATETREE_DATE_FORMAT"
+                 "Date format: "
+                 org-reverse-datetree-date-format))
+               (org-reverse-datetree-level-formats))
+          (org-reverse-datetree--level-formats type)))))
+
+(cl-defun org-reverse-datetree--find-or-insert (level text
+                                                      &key asc
+                                                      &allow-other-keys)
   "Find or create a heading with the given text at the given level.
 
 LEVEL is the level of a tree, and TEXT is a heading of the tree.
@@ -249,7 +302,10 @@ This function uses string comparison to compare the dates in two
 trees.  Therefore your date format must be alphabetically ordered,
 e.g. beginning with YYYY(-MM(-DD)).
 
-If a new tree is created, non-nil is returned."
+If a new tree is created, non-nil is returned.
+
+If ASC is non-nil, it creates a date tree in ascending
+order i.e. non-reverse datetree."
   (declare (indent 1))
   (let* ((prefix (concat (make-string (org-get-valid-level level) ?*) " "))
          (bounds (delq nil (list (save-excursion
@@ -274,13 +330,16 @@ If a new tree is created, non-nil is returned."
                                        (end-of-line 1)
                                        (setq found t)
                                        (throw 'search t)))
-           ((string< here text) (progn
-                                  (end-of-line 0)
-                                  (org-reverse-datetree--insert-heading
-                                   prefix text)
-                                  (setq created t
-                                        found t)
-                                  (throw 'search t)))))))
+           ((if asc
+                (string> here text)
+              (string< here text))
+            (progn
+              (end-of-line 0)
+              (org-reverse-datetree--insert-heading
+               prefix text)
+              (setq created t
+                    found t)
+              (throw 'search t)))))))
     (unless found
       (goto-char (or bound (point-max)))
       (org-reverse-datetree--insert-heading
@@ -315,12 +374,17 @@ TEXT is a heading text."
 
 (defun org-reverse-datetree--get-file-headers ()
   "Get the file headers of the current Org buffer."
+  (require 'org-element)
   (let ((buffer-ast (org-with-wide-buffer (org-element-parse-buffer))))
     (setq org-reverse-datetree--file-headers
-          (org-element-map buffer-ast 'keyword
-            (lambda (keyword)
-              (cons (org-element-property :key keyword)
-                    (org-element-property :value keyword)))))))
+          (or (org-element-map buffer-ast 'keyword
+                (lambda (keyword)
+                  (cons (org-element-property :key keyword)
+                        (org-element-property :value keyword))))
+              ;; If the file has no header, set the value to a
+              ;; meaningless item to indicate that the headers have
+              ;; already been read.
+              '(("" . t))))))
 
 (defun org-reverse-datetree--insert-header (key value)
   "Insert a pair of KEY and VALUE into the file header."
@@ -347,6 +411,9 @@ TEXT is a heading text."
 
 (defun org-reverse-datetree--lookup-header (key)
   "Look up KEY from the file headers stored as a local variable."
+  ;; First read the headers if it has not yet.
+  (unless org-reverse-datetree--file-headers
+    (org-reverse-datetree--get-file-headers))
   (cdr (assoc key org-reverse-datetree--file-headers)))
 
 (defun org-reverse-datetree--lookup-type-header-1 ()
@@ -412,6 +479,42 @@ as the default value, inserts the value, and returns the value."
       (org-reverse-datetree--insert-header key ret)
       ret)))
 
+(cl-defun org-reverse-datetree--lookup-file-name-header (key prompt
+                                                             &key
+                                                             abbreviate)
+  "Look up a file name file header or ask for a value.
+
+This function looks up KEY from the file headers.  If the key is
+not contained, it asks for a new value with PROMPT, inserts the
+value, and returns the value.
+
+If ABBREVIATE is non-nil, abbreviate the file name."
+  (if-let ((value (org-reverse-datetree--lookup-header key)))
+      (string-trim value)
+    (let ((ret (read-file-name prompt)))
+      (org-reverse-datetree--insert-header
+       key (org-reverse-datetree--relative-file ret abbreviate))
+      ret)))
+
+(defun org-reverse-datetree--relative-file (dest src)
+  "Return the relative file name of DEST from SRC or abbreviate DEST."
+  (let* ((project-a (and (featurep 'project)
+                         (project-current nil (file-name-directory dest))))
+         (project-b (and (featurep 'project)
+                         (project-current nil (file-name-directory src)))))
+    (if (or (and project-a
+                 project-b
+                 (file-equal-p (car (project-roots project-a))
+                               (car (project-roots project-b))))
+            (and (not project-a)
+                 (not project-b)
+                 (file-equal-p (file-name-directory dest)
+                               (file-name-directory src))))
+        (file-relative-name dest (file-name-directory src))
+      (abbreviate-file-name dest))))
+
+;;;; Navigational commands
+
 ;;;###autoload
 (cl-defun org-reverse-datetree-goto-date-in-file (&optional time
                                                             &key return)
@@ -428,43 +531,18 @@ When this function is called interactively, it asks for TIME using
                      :return nil))
   (unless (derived-mode-p 'org-mode)
     (user-error "Not in org-mode"))
-  (if org-reverse-datetree-level-formats
-      (org-reverse-datetree-2 time org-reverse-datetree-level-formats
-                              return)
-    (org-reverse-datetree--get-file-headers)
-    (let* ((type (org-reverse-datetree--lookup-type-header-1))
-           (org-reverse-datetree-year-format
-            (org-reverse-datetree--lookup-format-header
-             "REVERSE_DATETREE_YEAR_FORMAT"
-             "Year format: "
-             org-reverse-datetree-year-format))
-           (org-reverse-datetree-month-format
-            (when (memq type '(month month-and-week))
-              (org-reverse-datetree--lookup-format-header
-               "REVERSE_DATETREE_MONTH_FORMAT"
-               "Month format: "
-               org-reverse-datetree-month-format)))
-           (org-reverse-datetree-week-format
-            (when (memq type '(week month-and-week))
-              (org-reverse-datetree--lookup-format-header
-               "REVERSE_DATETREE_WEEK_FORMAT"
-               "Week format: "
-               org-reverse-datetree-week-format)))
-           (org-reverse-datetree-date-format
-            (org-reverse-datetree--lookup-format-header
-             "REVERSE_DATETREE_DATE_FORMAT"
-             "Date format: "
-             org-reverse-datetree-date-format))
-           (org-reverse-datetree-level-formats
-            (org-reverse-datetree--level-formats type)))
-      (org-reverse-datetree-2 time org-reverse-datetree-level-formats
-                              return))))
+  (org-reverse-datetree-2 time (org-reverse-datetree--get-level-formats)
+                          return
+                          :asc org-reverse-datetree-non-reverse))
 
 (cl-defun org-reverse-datetree-goto-read-date-in-file (&rest args)
   "Find or create a heading as configured in the file headers.
 
 This function is like `org-reverse-datetree-goto-date-in-file',
-but it always asks for a date even if it is called non-interactively."
+but it always asks for a date even if it is called non-interactively.
+
+ARGS is the arguments to `org-reverse-datetree-goto-date-in-file'
+after the time."
   (interactive)
   (apply #'org-reverse-datetree-goto-date-in-file
          (org-read-date nil t nil)
@@ -473,19 +551,6 @@ but it always asks for a date even if it is called non-interactively."
 (defun org-reverse-datetree--timestamp-to-time (s)
   "Convert timestamp string S into internal time."
   (apply #'encode-time (org-parse-time-string s)))
-
-(defun org-reverse-datetree--timestamp-from-string (s)
-  "Convert Org timestamp S, as a string, into a timestamp object.
-Return nil if S is not a valid timestamp string."
-  (when (org-string-nw-p s)
-    (with-temp-buffer
-      (save-excursion (insert s))
-      (org-element-timestamp-parser))))
-
-(defun org-reverse-datetree--parse-timestamp-string (s)
-  "Parse a timestamp string S and return a corresponding Emacs time."
-  (org-reverse-datetree--timestamp-to-time
-   (org-reverse-datetree--timestamp-from-string s)))
 
 (cl-defun org-reverse-datetree--get-entry-time (&key ask-always
                                                      (prefer '("CLOSED")))
@@ -543,7 +608,7 @@ Return a string describing the operation."
   "Refile the current Org entry into a configured date tree in a file.
 
 This function refiles the current entry into a date tree in FILE
-configured in the headers of the file. The same configuration as
+configured in the headers of the file.  The same configuration as
 `org-reverse-datetree-goto-date-in-file' is used.
 
 The location in the date tree is specified by TIME, which is an
@@ -581,9 +646,9 @@ as arguments."
                   (setq region-end (- region-end len))
                   (goto-char region-start)))))
            (let ((message-log-max nil))
-             (message (format "Refiled to %s:\n%s"
-                              file
-                              (string-join (nreverse msgs) "\n")))))
+             (message "Refiled to %s:\n%s"
+                      file
+                      (string-join (nreverse msgs) "\n"))))
        (org-reverse-datetree--refile-to-file
         file time :ask-always ask-always :prefer prefer)))
     ('org-agenda-mode
@@ -642,6 +707,190 @@ as arguments."
              file time :ask-always ask-always :prefer prefer))))))
     (_ (user-error "Not in org-mode or org-agenda-mode"))))
 
+;;;; Archiving
+
+;; Based on `org-archive-subtree' in org-archive.el 9.4-dev
+;;;###autoload
+(defun org-reverse-datetree-archive-subtree (&optional find-done)
+  "An org-reverse-datetree equivalent to `org-archive-subtree'.
+
+A prefix argument FIND-DONE should be treated as in
+`org-archive-subtree'."
+  (interactive "P")
+  (require 'org-archive)
+  (unless (fboundp 'org-show-all)
+    (user-error "This function requires `org-show-all' but it is unavailable"))
+  (if (and (org-region-active-p) org-loop-over-headlines-in-active-region)
+      (let ((cl (if (eq org-loop-over-headlines-in-active-region 'start-level)
+        	    'region-start-level 'region))
+            org-loop-over-headlines-in-active-region)
+        (org-map-entries
+         `(progn (setq org-map-continue-from (progn (org-back-to-heading) (point)))
+        	 (org-reverse-datetree-archive-subtree ,find-done))
+         org-loop-over-headlines-in-active-region
+         cl (if (org-invisible-p) (org-end-of-subtree nil t))))
+    (cond
+     ((equal find-done '(4))  (error "FIXME: Not implemented for prefix"))
+     ((equal find-done '(16)) (error "FIXME: Not implemented for prefix"))
+     (t
+      ;; Save all relevant TODO keyword-related variables.
+      (let* ((tr-org-todo-keywords-1 org-todo-keywords-1)
+             (tr-org-todo-kwd-alist org-todo-kwd-alist)
+             (tr-org-done-keywords org-done-keywords)
+             (tr-org-todo-regexp org-todo-regexp)
+             (tr-org-todo-line-regexp org-todo-line-regexp)
+             (tr-org-odd-levels-only org-odd-levels-only)
+             (this-buffer (current-buffer))
+             (current-time (current-time))
+             (time (format-time-string
+                    (substring (cdr org-time-stamp-formats) 1 -1)
+                    current-time))
+             (file (or (buffer-file-name (buffer-base-buffer))
+                       (error "No file associated to buffer")))
+             (afile (org-reverse-datetree--archive-file file))
+             (infile-p (file-equal-p file afile))
+             (newfile-p (and (org-string-nw-p afile)
+                             (not (file-exists-p afile))))
+             (buffer (cond ((not (org-string-nw-p afile)) this-buffer)
+                           ((find-buffer-visiting afile))
+                           ((find-file-noselect afile))
+                           (t (error "Cannot access file \"%s\"" afile))))
+             (archive-time (apply #'encode-time
+                                  (org-parse-time-string
+                                   (or (org-entry-get nil "CLOSED" t) time)))))
+        (save-excursion
+          (org-back-to-heading t)
+          ;; Get context information that will be lost by moving the
+          ;; tree.  See `org-archive-save-context-info'.
+          (let* ((all-tags (org-get-tags))
+                 (local-tags
+                  (cl-remove-if (lambda (tag)
+                                  (get-text-property 0 'inherited tag))
+                                all-tags))
+                 (inherited-tags
+                  (cl-remove-if-not (lambda (tag)
+                                      (get-text-property 0 'inherited tag))
+                                    all-tags))
+                 (context
+                  `((category . ,(org-get-category nil 'force-refresh))
+                    (file . ,file)
+                    (itags . ,(mapconcat #'identity inherited-tags " "))
+                    (ltags . ,(mapconcat #'identity local-tags " "))
+                    (olpath . ,(mapconcat #'identity
+                                          (org-get-outline-path)
+                                          "/"))
+                    (time . ,time)
+                    (todo . ,(org-entry-get (point) "TODO")))))
+            ;; We first only copy, in case something goes wrong
+            ;; we need to protect `this-command', to avoid kill-region sets it,
+            ;; which would lead to duplication of subtrees
+            (let (this-command) (org-copy-subtree 1 nil t))
+            (set-buffer buffer)
+            ;; Enforce Org mode for the archive buffer
+            (if (not (derived-mode-p 'org-mode))
+                ;; Force the mode for future visits.
+                (let ((org-insert-mode-line-in-empty-file t)
+                      (org-inhibit-startup t))
+                  (call-interactively #'org-mode)))
+            (when (and newfile-p org-archive-file-header-format)
+              (goto-char (point-max))
+              (insert (format org-archive-file-header-format
+                              (buffer-file-name this-buffer))))
+            (org-reverse-datetree-goto-date-in-file archive-time)
+            (org-narrow-to-subtree)
+            ;; Force the TODO keywords of the original buffer
+            (let ((org-todo-line-regexp tr-org-todo-line-regexp)
+                  (org-todo-keywords-1 tr-org-todo-keywords-1)
+                  (org-todo-kwd-alist tr-org-todo-kwd-alist)
+                  (org-done-keywords tr-org-done-keywords)
+                  (org-todo-regexp tr-org-todo-regexp)
+                  (org-todo-line-regexp tr-org-todo-line-regexp)
+                  (org-odd-levels-only
+                   (if (local-variable-p 'org-odd-levels-only (current-buffer))
+                       org-odd-levels-only
+                     tr-org-odd-levels-only)))
+              (goto-char (point-min))
+              ;; TODO: Find an alternative to `org-show-all'.
+              ;; org-show-all is unavailable in the Org shipped with
+              ;; Emacs 26.3.
+              (org-show-all '(headings blocks))
+              ;; Paste
+              ;; Append to the date tree
+              (org-end-of-subtree)
+              ;; Go to the beginning of the line
+              (forward-line 1)
+              (org-paste-subtree (org-get-valid-level
+                                  (1+ (length (org-reverse-datetree--get-level-formats)))))
+              ;; Shall we append inherited tags?
+              (and inherited-tags
+                   (or (and (eq org-archive-subtree-add-inherited-tags 'infile)
+                            infile-p)
+                       (eq org-archive-subtree-add-inherited-tags t))
+                   (org-set-tags all-tags))
+              ;; Mark the entry as done
+              (when (and org-archive-mark-done
+                         (let ((case-fold-search nil))
+                           (looking-at org-todo-line-regexp))
+                         (or (not (match-end 2))
+                             (not (member (match-string 2) org-done-keywords))))
+                (let (org-log-done org-todo-log-states)
+                  (org-todo
+                   (car (or (member org-archive-mark-done org-done-keywords)
+                            org-done-keywords)))))
+
+              ;; Add the context info.
+              (dolist (item org-archive-save-context-info)
+                (let ((value (cdr (assq item context))))
+                  (when (org-string-nw-p value)
+                    (org-entry-put
+                     (point)
+                     (concat "ARCHIVE_" (upcase (symbol-name item)))
+                     value))))
+              ;; Save and kill the buffer, if it is not the same
+              ;; buffer and depending on `org-archive-subtree-save-file-p'
+              (unless (eq this-buffer buffer)
+                (when (or (eq org-archive-subtree-save-file-p t)
+                          (and (boundp 'org-archive-from-agenda)
+                               (eq org-archive-subtree-save-file-p 'from-agenda)))
+                  (save-buffer)))
+              (widen))))
+        ;; Here we are back in the original buffer.  Everything seems
+        ;; to have worked.  So now run hooks, cut the tree and finish
+        ;; up.
+        (run-hooks 'org-archive-hook)
+        (let (this-command) (org-cut-subtree))
+        (when (featurep 'org-inlinetask)
+          (org-inlinetask-remove-END-maybe))
+        (setq org-markers-to-move nil)
+        (when org-provide-todo-statistics
+          (save-excursion
+            ;; Go to parent, even if no children exist.
+            (org-up-heading-safe)
+            ;; Update cookie of parent.
+            (org-update-statistics-cookies nil)))
+        (message "Subtree archived %s"
+                 ;; (if (eq this-buffer buffer)
+                 ;;     (concat "under heading: " heading)
+                 ;;   (concat "in file: " (abbreviate-file-name afile)))
+                 (concat "in file: " (abbreviate-file-name afile))))))
+    (org-reveal)
+    (if (looking-at "^[ \t]*$")
+	(outline-next-visible-heading 1))))
+
+(defun org-reverse-datetree--archive-file (origin-file)
+  "Retrieve the name of the archive file, relative from ORIGIN-FILE."
+  (let ((pname "REVERSE_DATETREE_ARCHIVE_FILE"))
+    (or (org-entry-get-with-inheritance pname)
+        (org-reverse-datetree--lookup-file-name-header
+         pname "Select an archive file: " :abbreviate origin-file))))
+
+;;;###autoload
+(defun org-reverse-datetree-agenda-archive ()
+  "Archive the entry or subtree belonging to the current agenda entry."
+  (interactive)
+  (funcall-interactively
+   #'org-agenda-archive-with 'org-reverse-datetree-archive-subtree))
+
 ;;;; Utility functions for defining formats
 (defun org-reverse-datetree-monday (&optional time)
   "Get Monday in the same week as TIME."
@@ -664,32 +913,65 @@ as arguments."
 ;;;; Maintenance commands
 
 ;;;###autoload
-(defun org-reverse-datetree-cleanup-empty-dates ()
-  "Delete empty date entries in the buffer."
+(cl-defun org-reverse-datetree-cleanup-empty-dates (&key noconfirm
+                                                         ancestors)
+  "Delete empty date entries in the buffer.
+
+If NOCONFIRM is non-nil, leaf nodes are deleted without
+confirmation. In non-interactive mode, you have to explicitly set
+this argument.
+
+If both NOCONFIRM and ANCESTORS are non-nil, upper level nodes
+are deleted without confirmation as well."
   (interactive)
   (unless (derived-mode-p 'org-mode)
     (user-error "Not in org-mode"))
-  (let ((search-spaces-regexp (rx (+ (any " \t\r\n")))))
-    (when (yes-or-no-p "Start from the beginning?")
-      (goto-char (point-min)))
-    (while (re-search-forward (rx (group bol "*** " (* nonl) (* space) "\n")
-                                  "*** ")
-                              nil t)
-      (goto-char (match-beginning 1))
-      (push-mark (match-end 1))
-      (setq mark-active t)
-      (when (yes-or-no-p "Delete this empty date?")
-        (call-interactively #'delete-region)))
-    (when (yes-or-no-p "Delete empty week/month entries from the beginning as well?")
-      (goto-char (point-min))
-      (while (re-search-forward (rx (group bol "** " (* nonl) (* space) "\n")
-                                    "** ")
-                                nil t)
-        (goto-char (match-beginning 1))
-        (push-mark (match-end 1))
-        (setq mark-active t)
-        (when (yes-or-no-p "Delete this empty entry?")
-          (call-interactively #'delete-region))))))
+  (let ((levels (length (org-reverse-datetree--get-level-formats)))
+        count)
+    (org-save-outline-visibility t
+      (outline-hide-sublevels (1+ levels))
+      (when (and (not noninteractive)
+                 (not (org-before-first-heading-p))
+                 (yes-or-no-p "Start from the beginning?"))
+        (goto-char (point-min)))
+      (catch 'abort
+        (while (> levels 0)
+          (setq count 0)
+          (while (re-search-forward
+                  (rx-to-string `(and bol
+                                      (group (= ,levels "*")
+                                             (+ " ")
+                                             (*? nonl)
+                                             (+ "\n"))
+                                      (or string-end
+                                          (and (** 1 ,levels "*")
+                                               " "))))
+                  nil t)
+            (let ((begin (match-beginning 1))
+                  (end (match-end 1)))
+              (cond
+               (noconfirm
+                (delete-region begin end)
+                (cl-incf count)
+                (goto-char begin))
+               ((not noninteractive)
+                (goto-char begin)
+                (push-mark end)
+                (setq mark-active t)
+                (when (yes-or-no-p "Delete this empty entry?")
+                  (call-interactively #'delete-region)
+                  (cl-incf count)
+                  (goto-char begin))))))
+          (when (= count 0)
+            (message "No trees were deleted. Aborting")
+            (throw 'abort t))
+          (if (and (> levels 1)
+                   (or (and ancestors (or noninteractive noconfirm))
+                       (yes-or-no-p "Clean up the upper level as well?")))
+              (progn
+                (cl-decf levels)
+                (goto-char (point-min)))
+            (throw 'abort t)))))))
 
 (provide 'org-reverse-datetree)
 ;;; org-reverse-datetree.el ends here
